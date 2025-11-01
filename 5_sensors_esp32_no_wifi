@@ -1,0 +1,127 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include <BH1750.h>
+#include "DHT.h"
+#include <ModbusMaster.h>
+
+// ---------------- BMP280 ----------------
+#define BMP_SDA 41
+#define BMP_SCL 40
+Adafruit_BMP280 bmp;
+
+// ---------------- BH1750 ----------------
+#define BH_SDA 41
+#define BH_SCL 40
+BH1750 lightMeter;
+
+// ---------------- DHT11 ----------------
+#define DHTPIN 6
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------------- MQ135 ----------------
+#define MQ135_PIN 7
+#define ADC_BITS 12
+#define ADC_MAX 4095.0
+#define VCC 3.3
+#define CLEAN_AIR_FACTOR 3.6
+#define RLOAD 10.0
+float R0 = 0;
+
+float getRS() {
+  int adc = analogRead(MQ135_PIN);
+  float Vout = adc * (VCC / ADC_MAX);
+  if (Vout < 0.01) Vout = 0.01;
+  if (Vout > (VCC - 0.01)) Vout = VCC - 0.01;
+  float RS = (VCC - Vout) * RLOAD / Vout;
+  return (RS < 0) ? 0 : RS;
+}
+
+// ---------------- ZTS-3001 ----------------
+#define RXD2 16
+#define TXD2 17
+ModbusMaster node;
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(ADC_BITS);
+  Serial.println("\nInitializing sensors...\n");
+
+  // BMP280
+  Wire.begin(BMP_SDA, BMP_SCL);
+  if (bmp.begin(0x76)) Serial.println("BMP280 detected");
+  else Serial.println("BMP280 not found");
+
+  // BH1750
+  Wire.begin(BH_SDA, BH_SCL);
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
+    Serial.println("BH1750 detected");
+  else Serial.println("BH1750 not found");
+
+  // DHT11
+  dht.begin();
+  Serial.println("DHT11 initialized");
+
+  // MQ135 calibration
+  Serial.println("Calibrating MQ135...");
+  float RS_sum = 0;
+  for (int i = 0; i < 100; i++) { RS_sum += getRS(); delay(50); }
+  R0 = (RS_sum / 100.0) / CLEAN_AIR_FACTOR;
+  Serial.printf("MQ135 Calibrated. R0 = %.2f kΩ\n", R0);
+
+  // ZTS Soil Sensor
+  Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
+  node.begin(1, Serial2);
+  Serial.println("ZTS-3001 initialized\n");
+
+  Serial.println("=== All sensors ready ===\n");
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  Serial.println("========== SENSOR DATA ==========");
+
+  // BMP280
+  Serial.printf("BMP280  | Temp: %.2f °C  Pressure: %.2f hPa  Altitude: %.2f m\n",
+    bmp.readTemperature(), bmp.readPressure() / 100.0, bmp.readAltitude(1013.25));
+
+  // BH1750
+  float lux = lightMeter.readLightLevel();
+  Serial.printf("BH1750  | Light Intensity: %.1f lx\n", lux);
+
+  // DHT11
+  float humidity = dht.readHumidity();
+  float dhtTemp = dht.readTemperature();
+  if (!isnan(humidity) && !isnan(dhtTemp)) {
+    float heatIndex = dht.computeHeatIndex(dhtTemp, humidity, false);
+    Serial.printf("DHT11   | Temp: %.1f °C  Humidity: %.1f %%  HeatIndex: %.1f °C\n",
+                  dhtTemp, humidity, heatIndex);
+  } else Serial.println("DHT11   | Read error");
+
+  // MQ135
+  float RS = getRS(); if (RS <= 0) RS = 0.01;
+  float ratio = RS / R0;
+  float CO2 = 110.47 * pow(ratio, -2.862);
+  float CO = 605.18 * pow(ratio, -3.937);
+  float NH3 = 77.255 * pow(ratio, -3.18);
+  Serial.printf("MQ135   | CO2: %.1f ppm  CO: %.1f ppm  NH3: %.1f ppm\n", CO2, CO, NH3);
+
+  // ZTS-3001
+  uint8_t result = node.readHoldingRegisters(0x0000, 6);
+  if (result == node.ku8MBSuccess) {
+    float moisture = node.getResponseBuffer(0) / 10.0f;
+    float temperature = node.getResponseBuffer(1) / 10.0f;
+    float ph = node.getResponseBuffer(3) / 10.0f;
+    float N = node.getResponseBuffer(4);
+    float P = node.getResponseBuffer(5);
+    float K = node.getResponseBuffer(6);
+    Serial.printf("ZTS3001 | Moisture: %.1f %%  Temp: %.1f °C  pH: %.1f  N: %.0f  P: %.0f  K: %.0f\n",
+      moisture, temperature, ph, N, P, K);
+  } else Serial.println("ZTS3001 | Read error");
+
+  Serial.println("=================================\n");
+  delay(4000);
+}
+
